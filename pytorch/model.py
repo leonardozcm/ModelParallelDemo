@@ -79,7 +79,7 @@ class FullyConnected(nn.Module):
         if self.model_parallel:
             x_list = []
             x_list = ray.get([worker.forward.remote(x) for worker in self.fcworkers])
-
+            
             return tuple(x_list)
         else:
             return self.fc(x)
