@@ -1,6 +1,8 @@
 # part of this code borrows from https://github.com/layumi/Person_reID_baseline_pytorch && https://github.com/ZhaoJ9014/face.evoLVe.PyTorch/blob/master/head/metrics.py
 from audioop import bias
+from operator import ne
 from select import select
+from tkinter.tix import Tree
 import torch
 import torch.nn as nn
 from torchvision import models
@@ -8,7 +10,7 @@ from torch.autograd import Variable
 
 
 class ft_net(nn.Module):
-    def __init__(self, feature_dim, num_classes, num_process=1, am=False, model_parallel=False, class_split=None):
+    def __init__(self, feature_dim):
         super(ft_net, self).__init__()
         model_ft = models.resnet50(pretrained=True)
         model_ft.avgpool = nn.AdaptiveAvgPool2d((1, 1))
@@ -25,16 +27,16 @@ class ft_net(nn.Module):
                     model_ft.avgpool
                 )
         self.features = nn.Linear(2048, feature_dim)
-        if am:
-            self.classifier = FullyConnected_AM(feature_dim, num_classes, num_process, model_parallel, class_split)
-        else:
-            self.classifier = FullyConnected(feature_dim, num_classes, num_process, model_parallel, class_split)
+        # if am:
+        #     self.classifier = FullyConnected_AM(feature_dim, num_classes, num_process, model_parallel, class_split)
+        # else:
+        #     self.classifier = FullyConnected(feature_dim, num_classes, num_process, model_parallel, class_split)
 
-    def forward(self, x, labels=None):
+    def forward(self, x):
         x = self.backbone(x)
         x = x.view(x.size(0), x.size(1))
         x = self.features(x)
-        x = self.classifier(x, labels)
+        # x = self.classifier(x, labels)
         return x
 
 import ray
@@ -43,46 +45,70 @@ import ray
 class FCActors(object):
     def __init__(self) -> None:
         self.linear = None
+        self.input = None
+        self.output = None
+        self.metric = nn.MSELoss()
 
     def buildParams(self,indim, outdim,bias):
         self.linear = nn.Linear(indim, outdim, bias)
 
     def forward(self, x):
-        output = self.linear(x)
+        self.input = x
+        self.input.retain_grad()
+        output = self.linear(self.input)
+        self.output = output
         return output
 
+    def backward(self,label):
+        loss = self.metric(self.output,label)
+        loss.backward()
+        print(self.input.grad.size())
+        return self.input
 
 
-class FullyConnected(nn.Module):
-    def __init__(self, in_dim, out_dim, num_process=1, model_parallel=False, class_split=None):
+
+# class FullyConnectedParallelFunc(Function):
+
+#     @staticmethod
+#     def forward(ctx, input, rayworkers):
+#         ctx.save(input, rayworkers)
+#         x_list = ray.get([rayworker.forward.remote(input) for rayworker in rayworkers])
+#         return x_list
+
+#     @staticmethod
+#     def backward(ctx, grad_output):
+
+#         pass
+
+
+class FullyConnected(object):
+    def __init__(self, in_dim, num_process=1, class_split=None):
         super(FullyConnected, self).__init__()
         self.num_process = num_process
-        self.model_parallel = model_parallel
-        if model_parallel:
-            self.fcworkers = [FCActors.remote() for _ in range(num_process)]
+        self.fcworkers = [FCActors.remote() for _ in range(num_process)]
+        self.output = None
 
-            ## build FC modules
-            ray.get([
-                worker.buildParams.remote(in_dim,class_split[i],bias) for i,worker in enumerate(self.fcworkers)
-            ])
+        ## build FC modules
+        ray.get([
+            worker.buildParams.remote(in_dim,class_split[i],bias) for i,worker in enumerate(self.fcworkers)
+        ])
 
 
-            # self.fc_chunks = nn.ModuleList()
-            # for i in range(num_process):
-            #     self.fc_chunks.append(
-            #         nn.Linear(in_dim, class_split[i], bias=False)
-            #     )
-        else:
-            self.fc = nn.Linear(in_dim, out_dim, bias=False)
+    def __call__(self, x):
+        x_list = ray.get([worker.forward.remote(x) for worker in self.fcworkers])
+        self.output = tuple(x_list)
+        # print(type(self.output[0]))
+        return tuple(x_list)
 
-    def forward(self, x, labels=None):
-        if self.model_parallel:
-            x_list = []
-            x_list = ray.get([worker.forward.remote(x) for worker in self.fcworkers])
-            
-            return tuple(x_list)
-        else:
-            return self.fc(x)
+    # simulate parallel backward 
+    def backward(self, label):
+        grad_outputs = ray.get([
+            worker.backward.remote(label[i]) for i,worker in enumerate(self.fcworkers)
+        ])
+        res = torch.zeros_like(grad_outputs[0])
+        for grad_output in grad_outputs:
+            res+=grad_output
+        return res   
 
 
 class FullyConnected_AM(nn.Module):
@@ -135,10 +161,13 @@ class AM_Branch(nn.Module):
 
 
 if __name__ == '__main__':
-    net = ft_net(256, 65536, 4, False,True,[16384] * 4)
+    net = ft_net(256)
+    classifier = FullyConnected(256, 4,[16384] * 4)
     # print(net)
     input = torch.FloatTensor(8, 3, 256, 128)
-    output = net(input)
+    feature_x = net(input)
+    output = classifier(feature_x)
+
     # print(output)
     print('net output size:')
     if isinstance(output, tuple):
@@ -146,3 +175,9 @@ if __name__ == '__main__':
             print(o.shape)
     else:
         print(output.shape)
+
+    grad_output = classifier.backward([torch.ones((8,16384))] * 4)
+    print(grad_output.shape)
+    feature_x.backward(grad_output)
+
+
